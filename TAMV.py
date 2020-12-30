@@ -166,7 +166,81 @@ def createDetector(t1=20,t2=200, all=0.5, area=200):
     detector = cv2.SimpleBlobDetector_create(params)
     return(detector)
 
+# For a given array of circles (x,y,r), discard any values where the x,y deviates beyond maxDeviation from the given root
+# This should return only circles considered concentric-ish of the given root
+def discardOutliers(circles, rootX, rootY, maxDeviation=10):
+    accumulator = []
+    for (x,y,r) in circles:
+        if (x < rootX - maxDeviation or x > rootX + maxDeviation):
+            continue
+        if (y < rootY - maxDeviation or y > rootY + maxDeviation):
+            continue
+        accumulator.append((x,y,r))
+    return accumulator
 
+# Splits out the channels of the image and equalizes the histogram of the grayscale, and then merges them again
+# This process greatly enhances the contrast which makes the circles of the nozzle clearer
+def hisEqulColor(img):
+    ycrcb=cv2.cvtColor(img,cv2.COLOR_BGR2YCR_CB)
+    channels=cv2.split(ycrcb)
+    cv2.equalizeHist(channels[0],channels[0])
+    cv2.merge(channels,ycrcb)
+    cv2.cvtColor(ycrcb,cv2.COLOR_YCR_CB2BGR,img)
+    return img
+
+# Uses Hough circle detection to recursively find concentric circles
+def circleDetector(frame, sensitivity=200, requiredPoints=0.85, maxDepth=3):
+    # Equalise histogram and greyscale the image as Hough circles requires greyscale
+	enhanced = cv2.cvtColor(hisEqulColor(frame), cv2.COLOR_BGR2GRAY)
+
+	circles = cv2.HoughCircles(enhanced, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
+        param1=sensitivity, param2=requiredPoints, minRadius=5, maxRadius=0)
+
+    # centre point accumulator, which we will use to average the circle centre points later
+	centres = []
+	if circles is not None:
+		circles = np.round(circles[0,:]).astype('int')
+		for (rootX,rootY,rootRadius) in circles:
+			# iterate through the root circles and look for concentric circles
+			# this step is required because Hough circle detection will only return the largest possible circle
+			# around an origin, so we recursively exclude the root circle by setting the maxRadius
+			cropFromX = rootX - rootRadius
+			cropToX = rootX + rootRadius
+			cropFromY = rootY - rootRadius
+			cropToY = rootY + rootRadius
+			
+			croppedImg = enhanced[cropFromY:cropToY, cropFromX:cropToX]
+			subCentres = [[rootX,rootY]]
+			depth = 1
+			while True:
+				if (depth > maxDepth):
+					break
+				subCircles = cv2.HoughCircles(croppedImg, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
+					param1=sensitivity, param2=requiredPoints, minRadius=5, maxRadius=rootRadius-10)
+				if subCircles is not None:
+					subCircles = np.round(subCircles[0,:]).astype('int')
+					subCircles = discardOutliers(subCircles, rootX - cropFromX, rootY - cropFromY)
+					if (len(subCircles) == 0):
+						break
+					np.append(subCentres, [(x+rootX-rootRadius, y+rootY-rootRadius,r) for (x,y,r) in subCircles])
+				else:
+					break
+				depth += 1
+			centres.append(subCentres)
+
+    # No centres returned found means no circles
+	if (len(centres) == 0): return None
+	maxCircles = 0
+
+	returnedCircles = []
+	for concentrics in centres:
+		# We're going to average all of the centres to cater for some small drift between circles, but
+		# the smallest circle will be heavily weighted, as it should (ideally) match the inner most circle on the nozzle
+		weights = np.full(len(concentrics), 1)
+		weights[len(weights)-1] = 2
+		avgX,avgY = np.round(np.average(concentrics, 0, weights)).astype('int')
+		returnedCircles.append((avgX, avgY))
+	return returnedCircles
 
 def vectDist(xy1,xy2):
     # Final rounding and int() because we are really calculating pixels here. 
@@ -346,7 +420,6 @@ def repeatReport():
     print('+-------------------------------------------------------------------------------------------+')
     print('Note: Repeatability cannot be better than one pixel, see Millimeters per Pixel, above.')
 
-
 ###################################################################################
 # This method runs in a separate thread, to own the camera, 
 # present video stream to X11 window, 
@@ -401,17 +474,19 @@ def runVideoStream():
         if (mono): frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if (blur[0]): frame = cv2.medianBlur(frame, blur[1])
 
-        keypoints = detector.detect(frame)
+        # don't want this anymore
+        #keypoints = detector.detect(frame)
+        keypoints = circleDetector(frame)
 
+        
         # draw the timestamp on the frame AFTER the circle detector! Otherwise it finds the circles in the numbers.
         frame = putText(frame,'timestamp',offsety=99)
         frame = putText(frame,'Q',offsetx=99,offsety=-99)
-        if(not OKTS): frame = putText(frame,'-',offsetx=99,offsety=-99)
-        #cv2.putText(frame, ts, (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,0.90, (0, 0, 255), 1)
-        #cv2.putText(frame, extraText, (int(target[0] - 25), int(target[1] + 50) ), cv2.FONT_HERSHEY_SIMPLEX,0.90, (0, 0, 255), 1)
-        #cv2.putText(frame, 'Q', (frame.shape[1] - 22, 22), cv2.FONT_HERSHEY_SIMPLEX,0.90, (0, 0, 255), 1)
-        #if(not OKTS): cv2.putText(frame, '-', (frame.shape[1] - 22, 22), cv2.FONT_HERSHEY_SIMPLEX,0.90, (0, 0, 255), 1)
 
+        #@todo Why? 
+        if(not OKTS): frame = putText(frame,'-',offsetx=99,offsety=-99)
+
+        # Main thread requested showing the crosshair
         if (XRET):
             frame = cv2.line(frame, (target[0],    target[1]-25), (target[0],    target[1]+25), (0, 255, 0), 1) 
             frame = cv2.line(frame, (target[0]-25, target[1]   ), (target[0]+25, target[1]   ), (0, 255, 0), 1) 
@@ -422,7 +497,7 @@ def runVideoStream():
             key = cv2.waitKey(1) # Required to get frames to display.
             continue
 
-        if(nocircle> 25): 
+        if(nocircle > 25): 
             showBlobs(fg)
             nocircle = 0 
 
@@ -452,8 +527,13 @@ def runVideoStream():
 
         # Found one and only one circle.  Put it on the frame.
         nocircle = 0 
-        xy = np.around(keypoints[0].pt)
-        r = np.around(keypoints[0].size/2)            
+
+        # remove old blob code, replace with circles
+        # xy = np.around(keypoints[0].pt)
+        # r = np.around(keypoints[0].size/2)            
+        (x,y) = keypoints[0]
+        r = 25 # just mock a radius since it's not relevant
+
         # draw the blobs that look circular
         # cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS ensures the size of the circle corresponds to the size of blob
         frame = cv2.drawKeypoints(frame, keypoints, np.array([]), (0,0,255), cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
