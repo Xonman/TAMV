@@ -149,8 +149,8 @@ def vidWindow():
 def createDetector(t1=20,t2=200, all=0.5, area=200):
         # Setup SimpleBlobDetector parameters.
     params = cv2.SimpleBlobDetector_Params()
-    params.minThreshold = t1;          # Change thresholds
-    params.maxThreshold = t2;
+    params.minThreshold = t1           # Change thresholds
+    params.maxThreshold = t2 
     params.filterByArea = True         # Filter by Area.
     params.minArea = area
     params.filterByCircularity = True  # Filter by Circularity
@@ -189,58 +189,55 @@ def hisEqulColor(img):
     return img
 
 # Uses Hough circle detection to recursively find concentric circles
-def circleDetector(frame, sensitivity=200, requiredPoints=0.85, maxDepth=3):
+def circleDetector(frame, sensitivity=300, requiredPoints=0.5, maxDepth=3):
     # Equalise histogram and greyscale the image as Hough circles requires greyscale
-	enhanced = cv2.cvtColor(hisEqulColor(frame), cv2.COLOR_BGR2GRAY)
+    # Removed for now because it didn't give good enough results for the cost
+    # enhanced = cv2.cvtColor(hisEqulColor(frame), cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-	circles = cv2.HoughCircles(enhanced, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
+    circles = cv2.HoughCircles(enhanced, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
         param1=sensitivity, param2=requiredPoints, minRadius=5, maxRadius=0)
 
     # centre point accumulator, which we will use to average the circle centre points later
-	centres = []
-	if circles is not None:
-		circles = np.round(circles[0,:]).astype('int')
-		for (rootX,rootY,rootRadius) in circles:
-			# iterate through the root circles and look for concentric circles
-			# this step is required because Hough circle detection will only return the largest possible circle
-			# around an origin, so we recursively exclude the root circle by setting the maxRadius
-			cropFromX = rootX - rootRadius
-			cropToX = rootX + rootRadius
-			cropFromY = rootY - rootRadius
-			cropToY = rootY + rootRadius
-			
-			croppedImg = enhanced[cropFromY:cropToY, cropFromX:cropToX]
-			subCentres = [[rootX,rootY]]
-			depth = 1
-			while True:
-				if (depth > maxDepth):
-					break
-				subCircles = cv2.HoughCircles(croppedImg, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
-					param1=sensitivity, param2=requiredPoints, minRadius=5, maxRadius=rootRadius-10)
-				if subCircles is not None:
-					subCircles = np.round(subCircles[0,:]).astype('int')
-					subCircles = discardOutliers(subCircles, rootX - cropFromX, rootY - cropFromY)
-					if (len(subCircles) == 0):
-						break
-					np.append(subCentres, [(x+rootX-rootRadius, y+rootY-rootRadius,r) for (x,y,r) in subCircles])
-				else:
-					break
-				depth += 1
-			centres.append(subCentres)
+    centres = []
+    if circles is not None:
+        circles = np.round(circles[0,:]).astype('int')
+        for (rootX,rootY,rootRadius) in circles:            
+            # croppedImg = enhanced[cropFromY:cropToY, cropFromX:cropToX]
+            croppedImg = enhanced
+            subCentres = [[rootX,rootY,rootRadius]]
+            depth = 1
+            lastMinRadius = rootRadius
+            while True:
+                if (depth > maxDepth):
+                    break
+                subCircles = cv2.HoughCircles(croppedImg, cv2.HOUGH_GRADIENT_ALT, dp=2, minDist=30,
+                    param1=sensitivity, param2=requiredPoints, minRadius=5, maxRadius=lastMinRadius-5)
+                if subCircles is not None:
+                    subCircles = np.round(subCircles[0,:]).astype('int')
+                    subCircles = discardOutliers(subCircles, rootX, rootY)
+                    if (len(subCircles) == 0):
+                        break
+                    np.append(subCentres, subCircles)
+                    lastMinRadius = np.min([r for (x,y,r) in subCircles])
+                else:
+                    break
+                depth += 1
+            centres.append(subCentres)
 
     # No centres returned found means no circles
-	if (len(centres) == 0): return None
-	maxCircles = 0
+    if (len(centres) == 0): return None
+    maxCircles = 0
 
-	returnedCircles = []
-	for concentrics in centres:
-		# We're going to average all of the centres to cater for some small drift between circles, but
-		# the smallest circle will be heavily weighted, as it should (ideally) match the inner most circle on the nozzle
-		weights = np.full(len(concentrics), 1)
-		weights[len(weights)-1] = 2
-		avgX,avgY = np.round(np.average(concentrics, 0, weights)).astype('int')
-		returnedCircles.append((avgX, avgY))
-	return returnedCircles
+    returnedCircles = []
+    for concentrics in centres:
+        # We're going to average all of the centres to cater for some small drift between circles, but
+        # the smallest circle will be heavily weighted, as it should (ideally) match the inner most circle on the nozzle
+        weights = np.full(len(concentrics), 1)
+        weights[len(weights)-1] = 2
+        avgX,avgY,avgR = np.round(np.average(concentrics, 0, weights)).astype('int')
+        returnedCircles.append((avgX, avgY, avgR))
+    return returnedCircles
 
 def vectDist(xy1,xy2):
     # Final rounding and int() because we are really calculating pixels here. 
@@ -295,7 +292,7 @@ def eachTool(tool,rep):
     state = 0 # State machine for figuring out image rotation to carriage XY move mapping.
     rot = 0 # Amount of rotation of image.
     count=0
-    rd = 0;
+    rd = 0
 
     print('')
     print('')
@@ -316,9 +313,11 @@ def eachTool(tool,rep):
         print('#########################################################################')
 
     # loop over the frames from the video stream
+    waitingOnMessage = False
     while True:
-        if (rxq.empty()): 
+        if (rxq.empty() and not waitingOnMessage): 
             txq.put([TTMB])  # Tell subtask to send us circle messages. 
+            waitingOnMessage = True
             time.sleep(.1)
             continue
 
@@ -327,8 +326,10 @@ def eachTool(tool,rep):
             print("Skipping unknown queue message header ",qmsg[0])  # Should never happen.  Still check. 
             continue
 
+        waitingOnMessage = False
         # Found one and only one circle.  Process it.
         xy = qmsg[1]
+        # print("Incoming message", qmsg)
         target = qmsg[2]
 
         # Keep track of center of circle and average across many circles
@@ -340,24 +341,25 @@ def eachTool(tool,rep):
             avg[1] /= count
             avg = np.around(avg,3)
             #print('')
-            #print("state = ",state)
-            #print("Average Pixel Position = X{0:7.3f}  Y{1:7.3f} ".format(avg[0],avg[1]))
-            #print("Target        Position = X{0:7.3f}  Y{1:7.3f} ".format(target[0],target[1]))
+            # print("state = ",state)
+            # print("Average Pixel Position = X{0:7.3f}  Y{1:7.3f} ".format(avg[0],avg[1]))
+            # print("Target        Position = X{0:7.3f}  Y{1:7.3f} ".format(target[0],target[1]))
             if (state == 0):  # Finding Rotation: Collected frames before first move.
                 print("Initiating a small X move to calibrate camera to carriage rotation.")
                 oldxy = xy
                 printer.gCode("G91 G1 X-0.5 G90 ")
                 while(not rxq.empty()): rxq.get()   # re-sync: Ignore any frame messages that came in while we were doing other things. 
+                waitingOnMessage = True
                 txq.put([TTMB])  # Tell subtask to send us circle messages. 
                 state += 1
 
             elif (state == 1): # Finding Rotation: Move made, see if it aligns with carriage.
-                #print("   X = ",   xy[0])
-                #print("oldX = ",oldxy[0])
-                #print("   Y = ",   xy[1])
-                #print("oldY = ",oldxy[1])
-                #print("X movement detected = ",abs(oldxy[0]-xy[0]))
-                #print("Y movement detected = ",abs(oldxy[1]-xy[1]))
+                # print("   X = ",   xy[0])
+                # print("oldX = ",oldxy[0])
+                # print("   Y = ",   xy[1])
+                # print("oldY = ",oldxy[1])
+                # print("X movement detected = ",abs(oldxy[0]-xy[0]))
+                # print("Y movement detected = ",abs(oldxy[1]-xy[1]))
                 if (abs(int(oldxy[0])-int(xy[0])) > 2+abs(int(oldxy[1])-int(xy[1]))):
                     print("Found X movement via rotation, will now calibrate camera to carriage direction.")
                     mpp = 0.5/float(vectDist(xy,oldxy))
@@ -449,6 +451,7 @@ def runVideoStream():
         # Process Queue messages before frames. 
         if (not txq.empty()): 
             qmsg=txq.get()
+            # print('Subtask processing message, there are {} left in the queue'.format(txq.qsize()), qmsg)
             if (qmsg[0] == FOAD): return(0)
             if (qmsg[0] == STFU): OKTS = 0
             if (qmsg[0] == TTMB): OKTS = 1
@@ -497,13 +500,7 @@ def runVideoStream():
             key = cv2.waitKey(1) # Required to get frames to display.
             continue
 
-        if(nocircle > 25): 
-            showBlobs(fg)
-            nocircle = 0 
-
-
-        lk=len(keypoints)
-        if (lk == 0):
+        if keypoints is None:
             if (25 < (int(round(time.time() * 1000)) - rd)):
                 nocircle += 1
                 frame = putText(frame,'No circles found',offsety=3)                
@@ -513,6 +510,8 @@ def runVideoStream():
                 cv2.imshow("Nozzle", frame)
                 key = cv2.waitKey(1) # Required to get frames to display.
             continue
+
+        lk=len(keypoints)
         if (lk > 1):
             if (25 < (int(round(time.time() * 1000)) - rd)):
                 #printKeypointXYR(keypoints)
@@ -531,12 +530,15 @@ def runVideoStream():
         # remove old blob code, replace with circles
         # xy = np.around(keypoints[0].pt)
         # r = np.around(keypoints[0].size/2)            
-        (x,y) = keypoints[0]
-        r = 25 # just mock a radius since it's not relevant
+        x,y,r = keypoints[0]
+        xy = (x,y)
 
         # draw the blobs that look circular
         # cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS ensures the size of the circle corresponds to the size of blob
-        frame = cv2.drawKeypoints(frame, keypoints, np.array([]), (0,0,255), cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        # frame = cv2.drawKeypoints(frame, keypoints, np.array([]), (0,0,255), cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        for (x,y,r) in keypoints:
+            cv2.circle(frame, (x,y), r, (0,0,255) )
+            cv2.circle(frame, (x,y), 10, (0,255,0), 2)
         # Note its radius and position
         ts =  "X{0:7.2f} Y{1:7.2f} R{2:7.2f}".format(xy[0],xy[1],r)
         xy = np.uint16(xy)
@@ -553,35 +555,6 @@ def runVideoStream():
 
         # and tell our parent.
         if(OKTS): rxq.put([FRDT,xy,target]) # Message type 1, a set of XY coordinates, the target coordinates
-
-
-def showBlobs(im):
-    params = cv2.SimpleBlobDetector_Params()
-    params.minThreshold = 10;
-    params.maxThreshold = 200;
-    params.filterByArea = True         # Filter by Area.
-    params.minArea = 150
-    params.filterByCircularity = False  # Filter by Circularity
-    params.filterByConvexity = False    # Filter by Convexity
-    params.filterByInertia = False      # Filter by Inertia
-    params.minInertiaRatio = 0.15
-
-    detector = cv2.SimpleBlobDetector_create(params)
-    # Detect blobs.
-    keypoints = detector.detect(im)
-
-    # Draw detected blobs as red circles.
-    # cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS ensures the size of the circle corresponds to the size of blob
-    frame = cv2.drawKeypoints(im, keypoints, np.array([]), (0,0,255), cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    target = [int(np.around(frame.shape[1]/2)),int(np.around(frame.shape[0]/2))]
-    frame = putText(frame,'timestamp',offsety=99)
-    frame = putText(frame,'Blobs with less filters',offsety=4)
-    #cv2.putText(frame, "Blobs with less filters", (int(target[0] - 90), int(target[1] - 100 ) ), cv2.FONT_HERSHEY_SIMPLEX,0.90, (255, 0, 0), 1)
-
-    # Show keypoints
-    cv2.imshow("Blobs", frame)
-    cv2.waitKey(1)
-
 
 def putText(frame,text,color=(0, 0, 255),offsetx=0,offsety=0,stroke=1):  # Offsets are in character box size in pixels. 
     if (text == 'timestamp'): text = datetime.datetime.now().strftime("%m-%d-%Y %H:%M:%S")
